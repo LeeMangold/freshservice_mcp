@@ -85,6 +85,47 @@ The server implements tools across these Freshservice domains:
 - **Workspaces**: list and get workspace details
 - **Canned Responses**: list responses and folders
 - **Solution Articles**: CRUD operations for categories, folders, and articles; publish articles
+- **Analytics & Reporting**: Advanced analytics with automatic pagination and human-readable output (see below)
+
+### Analytics & Reporting Tools
+
+The server includes 5 advanced analytics functions that handle pagination automatically and return human-readable results:
+
+1. **`get_agent_lookup()`** - Cached mapping of agent/group IDs to names (5-minute TTL)
+   - Returns dictionaries: `{agent_id: {"name": "Full Name", "email": "..."}}`
+   - Automatically refreshes every 5 minutes
+   - Used internally by other analytics functions to resolve IDs to names
+
+2. **`search_tickets_all(query, max_results=500, fields=None, workspace_id=None)`** - Auto-paginated ticket search
+   - Returns ALL matching tickets up to max_results (capped at 1000)
+   - Optionally filters returned fields with `fields` parameter
+   - Returns `{success, tickets, total_fetched, pages_fetched, truncated}`
+
+3. **`get_ticket_stats(group_id=None, created_after=None, created_before=None, workspace_id=None)`** - Aggregated statistics
+   - Returns counts by status, priority, agent (by name), and type
+   - Requires at least one filter parameter
+   - Example: `get_ticket_stats(group_id=18000169214, created_after="2024-01-01")`
+
+4. **`get_agent_workload(agent_id=None, group_id=None, period="30d", created_after=None, created_before=None)`** - Per-agent metrics
+   - Returns ticket counts, resolution times, and average resolution hours
+   - Either `agent_id` OR `group_id` must be provided
+   - Supports period shorthand: "7d", "30d", "90d"
+   - Example: `get_agent_workload(agent_id=18000806759, period="30d")`
+
+5. **`get_team_comparison(group_ids, created_after=None, created_before=None)`** - Multi-team comparison
+   - Compares 2-10 teams side-by-side
+   - Returns closure rates, avg resolution times, and top 5 agents per team
+   - Defaults to last 30 days if dates not provided
+   - Example: `get_team_comparison(group_ids=[18000169214, 18000169215])`
+
+**Key Features:**
+- All functions handle Freshservice API pagination automatically (30/page limit)
+- All return human-readable names instead of IDs
+- All use the shared cache from `get_agent_lookup()` to minimize API calls
+- All support date range filtering with ISO dates ("2024-01-01") or period shorthand ("30d")
+- All include comprehensive error handling
+
+**Implementation Location:** All analytics functions are in [src/freshservice_mcp/server.py](src/freshservice_mcp/server.py) starting at line ~3267 (ANALYTICS FUNCTIONS section)
 
 ## Critical Implementation Details
 

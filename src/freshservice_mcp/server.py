@@ -1,14 +1,16 @@
 import os
-import re   
+import re
 import httpx
 import logging
 import base64
 import json
 import urllib.parse
 from typing import Optional, Dict, Union, Any, List
-from mcp.server.fastmcp import FastMCP 
+from mcp.server.fastmcp import FastMCP
 from enum import IntEnum, Enum
-from pydantic import BaseModel, Field 
+from pydantic import BaseModel, Field
+from datetime import datetime, timedelta
+from collections import defaultdict 
 
 
 from dotenv import load_dotenv 
@@ -26,6 +28,14 @@ mcp = FastMCP("freshservice_mcp")
 # API CREDENTIALS
 FRESHSERVICE_DOMAIN = os.getenv("FRESHSERVICE_DOMAIN")
 FRESHSERVICE_APIKEY = os.getenv("FRESHSERVICE_APIKEY")
+
+
+# Cache for agent/group lookups (TTL: 5 minutes)
+_lookup_cache: Dict[str, Any] = {
+    "agents": None,
+    "groups": None,
+    "timestamp": None
+}
 
 
 class TicketSource(IntEnum):
@@ -49,6 +59,8 @@ class TicketStatus(IntEnum):
     PENDING = 3
     RESOLVED = 4
     CLOSED = 5
+    IN_PROGRESS = 6
+    PENDING_RETURN = 7
 
 class TicketPriority(IntEnum):
     LOW = 1
@@ -3250,6 +3262,969 @@ async def publish_solution_article(article_id: int) -> Dict[str, Any]:
             return {
                 "error": f"Unexpected error occurred: {str(e)}"
             }
+
+
+# ANALYTICS FUNCTIONS
+
+@mcp.tool()
+async def get_agent_lookup() -> Dict[str, Any]:
+    """Returns cached dictionaries mapping agent IDs to names and group IDs to names.
+
+    The cache is refreshed every 5 minutes to balance performance with data freshness.
+
+    Returns:
+        {
+            "success": True,
+            "agents": {agent_id: {"name": "Full Name", "email": "email@domain.com"}},
+            "groups": {group_id: "Group Name"},
+            "cached_at": "ISO timestamp",
+            "ttl_seconds": 300
+        }
+    """
+    global _lookup_cache
+
+    # Check if cache is valid (less than 5 minutes old)
+    cache_ttl = 300  # 5 minutes in seconds
+    now = datetime.now()
+
+    if (_lookup_cache["timestamp"] is not None and
+        _lookup_cache["agents"] is not None and
+        _lookup_cache["groups"] is not None):
+        cache_age = (now - _lookup_cache["timestamp"]).total_seconds()
+        if cache_age < cache_ttl:
+            return {
+                "success": True,
+                "agents": _lookup_cache["agents"],
+                "groups": _lookup_cache["groups"],
+                "cached_at": _lookup_cache["timestamp"].isoformat(),
+                "ttl_seconds": cache_ttl,
+                "cache_age_seconds": cache_age
+            }
+
+    # Cache is stale or empty, refresh it
+    headers = get_auth_headers()
+    agents_dict = {}
+    groups_dict = {}
+
+    async with httpx.AsyncClient() as client:
+        # Fetch all agents with pagination
+        try:
+            page = 1
+            while True:
+                url = f"https://{FRESHSERVICE_DOMAIN}/api/v2/agents"
+                params = {"page": page, "per_page": 30}
+
+                response = await client.get(url, headers=headers, params=params)
+                response.raise_for_status()
+
+                data = response.json()
+                agents = data.get("agents", [])
+
+                for agent in agents:
+                    agent_id = agent.get("id")
+                    first_name = agent.get("first_name", "")
+                    last_name = agent.get("last_name", "")
+                    email = agent.get("email", "")
+                    full_name = f"{first_name} {last_name}".strip() or email
+
+                    agents_dict[agent_id] = {
+                        "name": full_name,
+                        "email": email
+                    }
+
+                # Check for next page
+                link_header = response.headers.get("Link", "")
+                pagination_info = parse_link_header(link_header)
+
+                if not pagination_info.get("next"):
+                    break
+
+                page = pagination_info["next"]
+
+        except httpx.HTTPStatusError as e:
+            error_text = None
+            try:
+                error_text = e.response.json() if e.response else None
+            except Exception:
+                error_text = e.response.text if e.response else None
+
+            return {
+                "success": False,
+                "error": f"Failed to fetch agents: {str(e)}",
+                "status_code": e.response.status_code if e.response else None,
+                "details": error_text
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Unexpected error fetching agents: {str(e)}"
+            }
+
+        # Fetch all agent groups with pagination
+        try:
+            page = 1
+            while True:
+                url = f"https://{FRESHSERVICE_DOMAIN}/api/v2/groups"
+                params = {"page": page, "per_page": 30}
+
+                response = await client.get(url, headers=headers, params=params)
+                response.raise_for_status()
+
+                data = response.json()
+                groups = data.get("groups", [])
+
+                for group in groups:
+                    group_id = group.get("id")
+                    group_name = group.get("name", f"Group-{group_id}")
+                    groups_dict[group_id] = group_name
+
+                # Check for next page
+                link_header = response.headers.get("Link", "")
+                pagination_info = parse_link_header(link_header)
+
+                if not pagination_info.get("next"):
+                    break
+
+                page = pagination_info["next"]
+
+        except httpx.HTTPStatusError as e:
+            error_text = None
+            try:
+                error_text = e.response.json() if e.response else None
+            except Exception:
+                error_text = e.response.text if e.response else None
+
+            return {
+                "success": False,
+                "error": f"Failed to fetch groups: {str(e)}",
+                "status_code": e.response.status_code if e.response else None,
+                "details": error_text
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Unexpected error fetching groups: {str(e)}"
+            }
+
+    # Update cache
+    _lookup_cache["agents"] = agents_dict
+    _lookup_cache["groups"] = groups_dict
+    _lookup_cache["timestamp"] = now
+
+    return {
+        "success": True,
+        "agents": agents_dict,
+        "groups": groups_dict,
+        "cached_at": now.isoformat(),
+        "ttl_seconds": cache_ttl,
+        "cache_age_seconds": 0
+    }
+
+
+@mcp.tool()
+async def search_tickets_all(
+    query: str,
+    max_results: int = 500,
+    fields: Optional[List[str]] = None,
+    workspace_id: Optional[int] = None
+) -> Dict[str, Any]:
+    """Search tickets with automatic pagination returning all results up to max_results.
+
+    This function automatically paginates through all ticket results and returns them
+    in a single response, up to the specified maximum.
+
+    Args:
+        query: Filter query (e.g., "status:2 AND priority:3")
+        max_results: Maximum tickets to return (default: 500, max: 1000)
+        fields: Optional list of field names to include in response
+        workspace_id: Optional workspace filter
+
+    Returns:
+        {
+            "success": True,
+            "tickets": [...],
+            "total_fetched": int,
+            "pages_fetched": int,
+            "truncated": bool  # True if max_results was hit
+        }
+    """
+    # Cap max_results at 1000 to prevent abuse
+    if max_results > 1000:
+        max_results = 1000
+
+    if max_results < 1:
+        return {
+            "success": False,
+            "error": "max_results must be at least 1"
+        }
+
+    # Freshservice API requires queries wrapped in double quotes
+    encoded_query = urllib.parse.quote(f'"{query}"')
+    base_url = f"https://{FRESHSERVICE_DOMAIN}/api/v2/tickets/filter?query={encoded_query}"
+
+    if workspace_id is not None:
+        base_url += f"&workspace_id={workspace_id}"
+
+    headers = get_auth_headers()
+    all_tickets = []
+    page = 1
+    truncated = False
+
+    async with httpx.AsyncClient() as client:
+        try:
+            while True:
+                url = f"{base_url}&page={page}"
+
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+
+                data = response.json()
+                tickets = data.get("tickets", [])
+
+                # If no tickets returned, we're done
+                if not tickets:
+                    break
+
+                # Filter fields if specified
+                if fields:
+                    filtered_tickets = []
+                    for ticket in tickets:
+                        filtered_ticket = {field: ticket.get(field) for field in fields if field in ticket}
+                        filtered_tickets.append(filtered_ticket)
+                    tickets = filtered_tickets
+
+                all_tickets.extend(tickets)
+
+                # Check if we've hit max_results
+                if len(all_tickets) >= max_results:
+                    all_tickets = all_tickets[:max_results]
+                    truncated = True
+                    break
+
+                # Check if we got a full page (30 results = more pages likely exist)
+                # Also check Link header for explicit next page
+                link_header = response.headers.get("Link", "")
+                pagination_info = parse_link_header(link_header)
+
+                # Continue if: (1) we got a full page OR (2) Link header says there's a next page
+                if len(tickets) < 30 and not pagination_info.get("next"):
+                    break
+
+                page += 1
+
+        except httpx.HTTPStatusError as e:
+            error_text = None
+            try:
+                error_text = e.response.json() if e.response else None
+            except Exception:
+                error_text = e.response.text if e.response else None
+
+            return {
+                "success": False,
+                "error": f"Failed to search tickets: {str(e)}",
+                "status_code": e.response.status_code if e.response else None,
+                "details": error_text
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Unexpected error: {str(e)}"
+            }
+
+    return {
+        "success": True,
+        "tickets": all_tickets,
+        "total_fetched": len(all_tickets),
+        "pages_fetched": page,
+        "truncated": truncated
+    }
+
+
+@mcp.tool()
+async def get_ticket_stats(
+    group_id: Optional[int] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    workspace_id: Optional[int] = None
+) -> Dict[str, Any]:
+    """Get aggregated ticket statistics with automatic pagination.
+
+    Returns comprehensive statistics including counts by status, priority, agent, and type.
+    All agent and group IDs are resolved to human-readable names.
+
+    Args:
+        group_id: Filter by agent group ID
+        created_after: ISO date string (e.g., "2024-01-01")
+        created_before: ISO date string (e.g., "2024-12-31")
+        workspace_id: Filter by workspace
+
+    Returns:
+        {
+            "success": True,
+            "stats": {
+                "total_tickets": int,
+                "by_status": {"Open": 10, "Pending": 5, ...},
+                "by_priority": {"Low": 20, "Medium": 15, ...},
+                "by_agent": {"Agent Name": 5, ...},
+                "by_type": {"Incident": 30, "Service Request": 10}
+            },
+            "filters": {...},
+            "date_range": {"start": "...", "end": "..."}
+        }
+    """
+    # Build query from parameters
+    query_parts = []
+
+    if group_id is not None:
+        query_parts.append(f"group_id:{group_id}")
+
+    if created_after is not None:
+        query_parts.append(f"created_at:>'{created_after}'")
+
+    if created_before is not None:
+        query_parts.append(f"created_at:<'{created_before}'")
+
+    if not query_parts:
+        return {
+            "success": False,
+            "error": "At least one filter parameter must be provided (group_id, created_after, or created_before)"
+        }
+
+    query = " AND ".join(query_parts)
+
+    # Fetch agent/group lookup for name resolution
+    lookup_result = await get_agent_lookup()
+    if not lookup_result.get("success"):
+        return {
+            "success": False,
+            "error": "Failed to fetch agent/group lookup",
+            "details": lookup_result
+        }
+
+    agents_lookup = lookup_result["agents"]
+    groups_lookup = lookup_result["groups"]
+
+    # Fetch all tickets with pagination
+    encoded_query = urllib.parse.quote(f'"{query}"')
+    base_url = f"https://{FRESHSERVICE_DOMAIN}/api/v2/tickets/filter?query={encoded_query}"
+
+    if workspace_id is not None:
+        base_url += f"&workspace_id={workspace_id}"
+
+    headers = get_auth_headers()
+    all_tickets = []
+    page = 1
+
+    async with httpx.AsyncClient() as client:
+        try:
+            while True:
+                url = f"{base_url}&page={page}"
+
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+
+                data = response.json()
+                tickets = data.get("tickets", [])
+
+                # If no tickets returned, we're done
+                if not tickets:
+                    break
+
+                all_tickets.extend(tickets)
+
+                # Check if we got a full page (30 results = more pages likely exist)
+                # Also check Link header for explicit next page
+                link_header = response.headers.get("Link", "")
+                pagination_info = parse_link_header(link_header)
+
+                # Continue if: (1) we got a full page OR (2) Link header says there's a next page
+                if len(tickets) < 30 and not pagination_info.get("next"):
+                    break
+
+                page += 1
+
+        except httpx.HTTPStatusError as e:
+            error_text = None
+            try:
+                error_text = e.response.json() if e.response else None
+            except Exception:
+                error_text = e.response.text if e.response else None
+
+            return {
+                "success": False,
+                "error": f"Failed to fetch tickets: {str(e)}",
+                "status_code": e.response.status_code if e.response else None,
+                "details": error_text
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Unexpected error: {str(e)}"
+            }
+
+    # Aggregate statistics
+    stats_by_status = defaultdict(int)
+    stats_by_priority = defaultdict(int)
+    stats_by_agent = defaultdict(int)
+    stats_by_type = defaultdict(int)
+
+    for ticket in all_tickets:
+        # Count by status
+        status_id = ticket.get("status")
+        status_name = _map_status_name(status_id)
+        stats_by_status[status_name] += 1
+
+        # Count by priority
+        priority_id = ticket.get("priority")
+        priority_name = _map_priority_name(priority_id)
+        stats_by_priority[priority_name] += 1
+
+        # Count by agent (responder)
+        responder_id = ticket.get("responder_id")
+        if responder_id and responder_id in agents_lookup:
+            agent_name = agents_lookup[responder_id]["name"]
+        elif responder_id:
+            agent_name = f"Agent-{responder_id}"
+        else:
+            agent_name = "Unassigned"
+        stats_by_agent[agent_name] += 1
+
+        # Count by type
+        ticket_type = ticket.get("type")
+        if ticket_type:
+            stats_by_type[ticket_type] += 1
+        else:
+            stats_by_type["Unknown"] += 1
+
+    return {
+        "success": True,
+        "stats": {
+            "total_tickets": len(all_tickets),
+            "by_status": dict(stats_by_status),
+            "by_priority": dict(stats_by_priority),
+            "by_agent": dict(stats_by_agent),
+            "by_type": dict(stats_by_type)
+        },
+        "filters": {
+            "group_id": group_id,
+            "group_name": groups_lookup.get(group_id) if group_id else None,
+            "created_after": created_after,
+            "created_before": created_before,
+            "workspace_id": workspace_id
+        },
+        "date_range": {
+            "start": created_after,
+            "end": created_before
+        }
+    }
+
+
+@mcp.tool()
+async def get_agent_workload(
+    agent_id: Optional[int] = None,
+    group_id: Optional[int] = None,
+    period: Optional[str] = "30d",
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None
+) -> Dict[str, Any]:
+    """Get workload metrics for agent(s) with automatic pagination.
+
+    Calculates detailed workload statistics including ticket counts and resolution times.
+    Either agent_id or group_id must be provided.
+
+    Args:
+        agent_id: Specific agent ID (if None, returns all agents in group)
+        group_id: Agent group ID (required if agent_id is None)
+        period: Time period shorthand ("7d", "30d", "90d") - used if created_after not provided
+        created_after: ISO date string (overrides period)
+        created_before: ISO date string (defaults to now)
+
+    Returns:
+        {
+            "success": True,
+            "agents": [
+                {
+                    "agent_id": int,
+                    "agent_name": "Full Name",
+                    "email": "...",
+                    "tickets_assigned": int,
+                    "tickets_resolved": int,
+                    "tickets_closed": int,
+                    "tickets_open": int,
+                    "avg_resolution_hours": float,
+                    "resolution_times": [hours, ...]
+                },
+                ...
+            ],
+            "date_range": {"start": "...", "end": "..."},
+            "group_name": "..." if group_id else None
+        }
+    """
+    # Validate: Either agent_id OR group_id must be provided
+    if agent_id is None and group_id is None:
+        return {
+            "success": False,
+            "error": "Either agent_id or group_id must be provided"
+        }
+
+    # Parse date range
+    if created_after is None:
+        try:
+            start_date = _parse_period(period)
+            created_after = start_date.isoformat()
+        except ValueError as e:
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    if created_before is None:
+        created_before = datetime.now().isoformat()
+
+    # Build query
+    query_parts = []
+    if agent_id is not None:
+        query_parts.append(f"responder_id:{agent_id}")
+    else:
+        query_parts.append(f"group_id:{group_id}")
+
+    query_parts.append(f"created_at:>'{created_after}'")
+    query_parts.append(f"created_at:<'{created_before}'")
+
+    query = " AND ".join(query_parts)
+
+    # Fetch agent/group lookup for name resolution
+    lookup_result = await get_agent_lookup()
+    if not lookup_result.get("success"):
+        return {
+            "success": False,
+            "error": "Failed to fetch agent/group lookup",
+            "details": lookup_result
+        }
+
+    agents_lookup = lookup_result["agents"]
+    groups_lookup = lookup_result["groups"]
+
+    # Fetch all matching tickets
+    encoded_query = urllib.parse.quote(f'"{query}"')
+    url = f"https://{FRESHSERVICE_DOMAIN}/api/v2/tickets/filter?query={encoded_query}"
+
+    headers = get_auth_headers()
+    all_tickets = []
+    page = 1
+
+    async with httpx.AsyncClient() as client:
+        try:
+            while True:
+                paginated_url = f"{url}&page={page}"
+
+                response = await client.get(paginated_url, headers=headers)
+                response.raise_for_status()
+
+                data = response.json()
+                tickets = data.get("tickets", [])
+
+                # If no tickets returned, we're done
+                if not tickets:
+                    break
+
+                all_tickets.extend(tickets)
+
+                # Check if we got a full page (30 results = more pages likely exist)
+                # Also check Link header for explicit next page
+                link_header = response.headers.get("Link", "")
+                pagination_info = parse_link_header(link_header)
+
+                # Continue if: (1) we got a full page OR (2) Link header says there's a next page
+                if len(tickets) < 30 and not pagination_info.get("next"):
+                    break
+
+                page += 1
+
+        except httpx.HTTPStatusError as e:
+            error_text = None
+            try:
+                error_text = e.response.json() if e.response else None
+            except Exception:
+                error_text = e.response.text if e.response else None
+
+            return {
+                "success": False,
+                "error": f"Failed to fetch tickets: {str(e)}",
+                "status_code": e.response.status_code if e.response else None,
+                "details": error_text
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Unexpected error: {str(e)}"
+            }
+
+    # Group tickets by responder_id
+    tickets_by_agent = defaultdict(list)
+    for ticket in all_tickets:
+        responder_id = ticket.get("responder_id")
+        if responder_id:
+            tickets_by_agent[responder_id].append(ticket)
+
+    # Calculate metrics for each agent
+    agent_metrics = []
+    for responder_id, tickets in tickets_by_agent.items():
+        # Get agent info
+        if responder_id in agents_lookup:
+            agent_name = agents_lookup[responder_id]["name"]
+            agent_email = agents_lookup[responder_id]["email"]
+        else:
+            agent_name = f"Agent-{responder_id}"
+            agent_email = "unknown"
+
+        # Count tickets by status
+        tickets_assigned = len(tickets)
+        tickets_resolved = sum(1 for t in tickets if t.get("status") == 4)
+        tickets_closed = sum(1 for t in tickets if t.get("status") == 5)
+        tickets_open = sum(1 for t in tickets if t.get("status") == 2)
+
+        # Calculate resolution times
+        resolution_times = []
+        for ticket in tickets:
+            if ticket.get("status") in [4, 5]:  # Resolved or Closed
+                created_at = ticket.get("created_at")
+                resolved_at = ticket.get("resolved_at") or ticket.get("updated_at")
+
+                if created_at and resolved_at:
+                    res_time = _calculate_resolution_time(created_at, resolved_at)
+                    if res_time is not None:
+                        resolution_times.append(res_time)
+
+        # Calculate average resolution time
+        avg_resolution_hours = None
+        if resolution_times:
+            avg_resolution_hours = sum(resolution_times) / len(resolution_times)
+
+        agent_metrics.append({
+            "agent_id": responder_id,
+            "agent_name": agent_name,
+            "email": agent_email,
+            "tickets_assigned": tickets_assigned,
+            "tickets_resolved": tickets_resolved,
+            "tickets_closed": tickets_closed,
+            "tickets_open": tickets_open,
+            "avg_resolution_hours": round(avg_resolution_hours, 2) if avg_resolution_hours else None,
+            "resolution_times": [round(t, 2) for t in resolution_times]
+        })
+
+    # Sort by tickets_assigned descending
+    agent_metrics.sort(key=lambda x: x["tickets_assigned"], reverse=True)
+
+    return {
+        "success": True,
+        "agents": agent_metrics,
+        "date_range": {
+            "start": created_after,
+            "end": created_before
+        },
+        "group_name": groups_lookup.get(group_id) if group_id else None
+    }
+
+
+@mcp.tool()
+async def get_team_comparison(
+    group_ids: List[int],
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None
+) -> Dict[str, Any]:
+    """Compare multiple agent groups side by side with aggregated metrics.
+
+    Provides comprehensive comparison of team performance including ticket counts,
+    closure rates, and top performing agents.
+
+    Args:
+        group_ids: List of agent group IDs to compare (2-10 groups)
+        created_after: ISO date string (defaults to 30 days ago)
+        created_before: ISO date string (defaults to now)
+
+    Returns:
+        {
+            "success": True,
+            "comparison": [
+                {
+                    "group_id": int,
+                    "group_name": "Team Name",
+                    "total_tickets": int,
+                    "open_tickets": int,
+                    "resolved_tickets": int,
+                    "closed_tickets": int,
+                    "closure_rate": float,
+                    "avg_resolution_hours": float,
+                    "top_agents": [{"agent_name": "...", "ticket_count": int}, ...]
+                },
+                ...
+            ],
+            "date_range": {"start": "...", "end": "..."},
+            "summary": {
+                "total_tickets_all_groups": int,
+                "average_closure_rate": float
+            }
+        }
+    """
+    # Validate group_ids
+    if not group_ids or len(group_ids) < 2:
+        return {
+            "success": False,
+            "error": "At least 2 group_ids must be provided for comparison"
+        }
+
+    if len(group_ids) > 10:
+        return {
+            "success": False,
+            "error": "Maximum 10 groups can be compared at once"
+        }
+
+    # Set default date range (30 days)
+    if created_after is None:
+        start_date = datetime.now() - timedelta(days=30)
+        created_after = start_date.isoformat()
+
+    if created_before is None:
+        created_before = datetime.now().isoformat()
+
+    # Fetch agent/group lookup for name resolution
+    lookup_result = await get_agent_lookup()
+    if not lookup_result.get("success"):
+        return {
+            "success": False,
+            "error": "Failed to fetch agent/group lookup",
+            "details": lookup_result
+        }
+
+    agents_lookup = lookup_result["agents"]
+    groups_lookup = lookup_result["groups"]
+
+    # Fetch and analyze data for each group
+    comparison_results = []
+    total_tickets_all_groups = 0
+    total_closure_rates = []
+
+    headers = get_auth_headers()
+
+    for group_id in group_ids:
+        # Build query for this group
+        query = f"group_id:{group_id} AND created_at:>'{created_after}' AND created_at:<'{created_before}'"
+        encoded_query = urllib.parse.quote(f'"{query}"')
+        url = f"https://{FRESHSERVICE_DOMAIN}/api/v2/tickets/filter?query={encoded_query}"
+
+        # Fetch all tickets for this group
+        all_tickets = []
+        page = 1
+
+        async with httpx.AsyncClient() as client:
+            try:
+                while True:
+                    paginated_url = f"{url}&page={page}"
+
+                    response = await client.get(paginated_url, headers=headers)
+                    response.raise_for_status()
+
+                    data = response.json()
+                    tickets = data.get("tickets", [])
+
+                    # If no tickets returned, we're done
+                    if not tickets:
+                        break
+
+                    all_tickets.extend(tickets)
+
+                    # Check if we got a full page (30 results = more pages likely exist)
+                    # Also check Link header for explicit next page
+                    link_header = response.headers.get("Link", "")
+                    pagination_info = parse_link_header(link_header)
+
+                    # Continue if: (1) we got a full page OR (2) Link header says there's a next page
+                    if len(tickets) < 30 and not pagination_info.get("next"):
+                        break
+
+                    page += 1
+
+            except httpx.HTTPStatusError as e:
+                error_text = None
+                try:
+                    error_text = e.response.json() if e.response else None
+                except Exception:
+                    error_text = e.response.text if e.response else None
+
+                return {
+                    "success": False,
+                    "error": f"Failed to fetch tickets for group {group_id}: {str(e)}",
+                    "status_code": e.response.status_code if e.response else None,
+                    "details": error_text
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Unexpected error for group {group_id}: {str(e)}"
+                }
+
+        # Analyze tickets for this group
+        total_tickets = len(all_tickets)
+        open_tickets = sum(1 for t in all_tickets if t.get("status") == 2)
+        resolved_tickets = sum(1 for t in all_tickets if t.get("status") == 4)
+        closed_tickets = sum(1 for t in all_tickets if t.get("status") == 5)
+
+        # Calculate closure rate
+        closure_rate = 0.0
+        if total_tickets > 0:
+            closure_rate = (resolved_tickets + closed_tickets) / total_tickets
+
+        # Calculate average resolution time
+        resolution_times = []
+        for ticket in all_tickets:
+            if ticket.get("status") in [4, 5]:  # Resolved or Closed
+                created_at = ticket.get("created_at")
+                resolved_at = ticket.get("resolved_at") or ticket.get("updated_at")
+
+                if created_at and resolved_at:
+                    res_time = _calculate_resolution_time(created_at, resolved_at)
+                    if res_time is not None:
+                        resolution_times.append(res_time)
+
+        avg_resolution_hours = None
+        if resolution_times:
+            avg_resolution_hours = sum(resolution_times) / len(resolution_times)
+
+        # Get top 5 agents by ticket count
+        agent_ticket_counts = defaultdict(int)
+        for ticket in all_tickets:
+            responder_id = ticket.get("responder_id")
+            if responder_id:
+                agent_ticket_counts[responder_id] += 1
+
+        top_agents = []
+        for agent_id, count in sorted(agent_ticket_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+            if agent_id in agents_lookup:
+                agent_name = agents_lookup[agent_id]["name"]
+            else:
+                agent_name = f"Agent-{agent_id}"
+
+            top_agents.append({
+                "agent_name": agent_name,
+                "ticket_count": count
+            })
+
+        # Add to comparison results
+        comparison_results.append({
+            "group_id": group_id,
+            "group_name": groups_lookup.get(group_id, f"Group-{group_id}"),
+            "total_tickets": total_tickets,
+            "open_tickets": open_tickets,
+            "resolved_tickets": resolved_tickets,
+            "closed_tickets": closed_tickets,
+            "closure_rate": round(closure_rate, 3),
+            "avg_resolution_hours": round(avg_resolution_hours, 2) if avg_resolution_hours else None,
+            "top_agents": top_agents
+        })
+
+        # Update summary stats
+        total_tickets_all_groups += total_tickets
+        total_closure_rates.append(closure_rate)
+
+    # Calculate summary
+    avg_closure_rate = 0.0
+    if total_closure_rates:
+        avg_closure_rate = sum(total_closure_rates) / len(total_closure_rates)
+
+    return {
+        "success": True,
+        "comparison": comparison_results,
+        "date_range": {
+            "start": created_after,
+            "end": created_before
+        },
+        "summary": {
+            "total_tickets_all_groups": total_tickets_all_groups,
+            "average_closure_rate": round(avg_closure_rate, 3)
+        }
+    }
+
+
+# HELPER FUNCTIONS FOR ANALYTICS
+
+def _parse_period(period: str) -> datetime:
+    """Parse period like '30d' to datetime.
+
+    Args:
+        period: Period string (e.g., "7d", "30d", "90d")
+
+    Returns:
+        datetime object representing the start of the period
+
+    Raises:
+        ValueError: If period format is invalid
+    """
+    if period.endswith('d'):
+        try:
+            days = int(period[:-1])
+            return datetime.now() - timedelta(days=days)
+        except ValueError:
+            raise ValueError(f"Invalid period format: {period}")
+    raise ValueError(f"Invalid period format: {period}. Use format like '7d', '30d', '90d'")
+
+
+def _map_status_name(status_id: int) -> str:
+    """Map ticket status ID to human-readable name.
+
+    Args:
+        status_id: Ticket status ID
+
+    Returns:
+        Human-readable status name
+    """
+    mapping = {
+        2: "Open",
+        3: "Pending",
+        4: "Resolved",
+        5: "Closed",
+        6: "In Progress",
+        7: "Pending Return"
+    }
+    return mapping.get(status_id, f"Status-{status_id}")
+
+
+def _map_priority_name(priority_id: int) -> str:
+    """Map ticket priority ID to human-readable name.
+
+    Args:
+        priority_id: Ticket priority ID
+
+    Returns:
+        Human-readable priority name
+    """
+    mapping = {
+        1: "Low",
+        2: "Medium",
+        3: "High",
+        4: "Urgent"
+    }
+    return mapping.get(priority_id, f"Priority-{priority_id}")
+
+
+def _calculate_resolution_time(created_at: str, resolved_at: str) -> Optional[float]:
+    """Calculate resolution time in hours.
+
+    Args:
+        created_at: ISO timestamp of ticket creation
+        resolved_at: ISO timestamp of ticket resolution
+
+    Returns:
+        Resolution time in hours, or None if calculation fails
+    """
+    try:
+        created = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+        resolved = datetime.fromisoformat(resolved_at.replace('Z', '+00:00'))
+        delta = resolved - created
+        return delta.total_seconds() / 3600  # Convert to hours
+    except (ValueError, AttributeError, TypeError):
+        return None
+
 
 # GET AUTH HEADERS
 def get_auth_headers():
