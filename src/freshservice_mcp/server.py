@@ -16,7 +16,7 @@ load_dotenv()
 
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 
 # Create MCP INSTANCE
@@ -229,10 +229,25 @@ async def create_ticket(
     status: Union[int, str],
     email: Optional[str] = None,
     requester_id: Optional[int] = None,
+    group_id: Optional[int] = None,
+    responder_id: Optional[int] = None,
     custom_fields: Optional[Dict[str, Any]] = None
 ) -> str:
-    """Create a ticket in Freshservice."""
-    
+    """Create a ticket in Freshservice.
+
+    Args:
+        subject: Ticket subject
+        description: Ticket description
+        source: Ticket source (e.g., EMAIL=1, PORTAL=2, PHONE=3)
+        priority: Ticket priority (LOW=1, MEDIUM=2, HIGH=3, URGENT=4)
+        status: Ticket status (OPEN=2, PENDING=3, RESOLVED=4, CLOSED=5)
+        email: Email of the requester
+        requester_id: ID of the requester
+        group_id: ID of the agent group to assign the ticket to
+        responder_id: ID of the agent to assign the ticket to
+        custom_fields: Custom field values as a dictionary
+    """
+
     if not email and not requester_id:
         return "Error: Either email or requester_id must be provided"
 
@@ -260,6 +275,10 @@ async def create_ticket(
         data["email"] = email
     if requester_id:
         data["requester_id"] = requester_id
+    if group_id:
+        data["group_id"] = group_id
+    if responder_id:
+        data["responder_id"] = responder_id
 
     if custom_fields:
         data["custom_fields"] = custom_fields

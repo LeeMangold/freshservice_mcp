@@ -13,6 +13,20 @@ async def test_create_ticket():
     result = await create_ticket(payload["subject"],payload["description"],payload["source"],payload["priority"],payload["status"],payload["email"])
     print(result)
 
+async def test_create_ticket_with_group_and_responder():
+    """Test creating a ticket with group_id and responder_id"""
+    result = await create_ticket(
+        subject="Test ticket with group and responder assignment",
+        description="This ticket tests the new group_id and responder_id parameters",
+        source=2,  # Portal
+        priority=2,  # Medium
+        status=2,  # Open
+        email="test@example.com",
+        group_id=18000169214,  # Security Team
+        responder_id=18000806759  # Lee Mangold
+    )
+    print(result)
+
 async def test_update_ticket():
     ticket_id = 862
     ticket_fields = {
